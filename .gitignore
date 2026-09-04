@@ -1,0 +1,22 @@
+# Data files
+data/
+*.dta
+*.csv
+
+# Quarto render artifacts
+*.rmarkdown
+*_files/
+
+# R session and project files (local state only)
+.RData
+.Rhistory
+.Rproj.user/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Empty/accidental files
+cd
+
+output/

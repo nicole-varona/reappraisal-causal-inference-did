@@ -1,0 +1,849 @@
+---
+title: "Reappraisal of 'Urban Political Structure and Inequality: Political Economy Lessons from Early Modern German Cities' (Schaff, 2024)"
+subtitle: "MY457 | WT 2026"
+date: today
+author: "62628"
+bibliography: references.bib
+format:
+  html:
+    embed-resources: true
+    toc: false
+    number-sections: false
+    fig-width: 11
+    fig-height: 6
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+# This chunk contains code that sets global options for the entire .qmd.
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE, linewidth=60)
+options(scipen=999, digits=4)
+
+# Apple removed OpenGL from macOS Tahoe (released 2025), which breaks the `rgl` package. 
+# `DIDmultiplegtDYN` depends transitively on `rgl` for optional 3D visualisations that I don't use, so I force `rgl` into NULL mode before loading the estimator. This must be set before `library(DIDmultiplegtDYN)`.
+# If you are running this code on macOS Sequoia or earlier, on Linux, or on Windows, these two lines are harmless but unnecessary — you can leave them in or comment them out.
+options(rgl.useNULL=TRUE)
+Sys.setenv(RGL_USE_NULL=TRUE)
+
+# Load packages
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, haven, fixest, DIDmultiplegtDYN, polars, modelsummary, kableExtra, gt, patchwork, broom, purrr, here, HonestDiD, dplyr, tibble)
+
+# Paths (reproducible across machines via here::here())
+data_dir <- here::here("data")
+out_dir  <- here::here("output")
+
+# Reproducibility
+set.seed(123456789)
+
+# Consistent ggplot theme across all event-study figures
+theme_schaff <- theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "grey90", linewidth = 0.3),
+    plot.background  = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.title       = element_text(face = "plain", size = 11),
+    axis.title       = element_text(size = 10)
+  )
+```
+
+```{r}
+#| label: dataload
+#| include: false
+
+# =============================================================================
+# Load data
+# =============================================================================
+
+df_noe <- read_dta(file.path(data_dir, "Noerdlingen_panel_replication_JEH.dta"))
+df_city <- read_dta(file.path(data_dir, "City_panel_replication_JEH.dta"))
+
+# Validation: catch silent changes in the underlying datasets
+stopifnot(
+  nrow(df_noe)  == 21579,
+  nrow(df_city) > 0,
+  "councilmemberterm" %in% names(df_noe),
+  "electionparticipation" %in% names(df_city)
+)
+```
+
+```{r}
+#| label: data-wrangling
+#| include: false
+
+# =============================================================================
+# Derived variables
+# =============================================================================
+
+# Time-invariant indicator: 1 if individual ever joins the council
+df_noe <- df_noe %>%
+  group_by(ID) %>%
+  mutate(councilmember_tinvar = as.integer(
+    any(councilmemberterm == 1, na.rm = TRUE)
+  )) %>%
+  ungroup()
+
+# Subset used in the Thirty Years' War triple-difference (Table 5, Figs 5-6)
+df_30yw <- df_noe %>% filter(units_30yw == 1, year >= 1603, year <= 1646)
+
+# Occupational dummies used as controls
+occ_vars <- grep("^occupation_", names(df_noe), value = TRUE)
+
+# Counts used in inline references throughout the document
+n_magistrates <- length(unique(df_noe$ID[df_noe$councilmember_tinvar == 1]))
+```
+
+```{r}
+#| label: helpers
+#| include: false
+
+# =============================================================================
+# Helper functions used throughout the document
+# =============================================================================
+
+# Extract ATT (period 1) from a did_multiplegt_dyn result, returning a tibble row
+extract_dcdh_summary <- function(res, label_y, label_spec) {
+  eff <- res$results$Effects
+  tibble(
+    Outcome       = label_y,
+    Specification = label_spec,
+    ATT           = round(eff[1, "Estimate"], 3),
+    SE            = round(eff[1, "SE"],       3),
+    Up_95_CI      = round(eff[1, "UB CI"],    3),
+    Lo_95_CI      = round(eff[1, "LB CI"],    3),
+    N             = eff[1, "N"]
+  )
+}
+
+# Plot a single event-study panel in the paper's style.
+# Placebos returned by did_multiplegt_dyn are indexed 1..K with Placebo_1 being
+# the period immediately before the omitted reference k=-1
+plot_event_dcdh <- function(res, title = "", y_label = "Treatment effect") {
+  pl <- as.data.frame(res$results$Placebos)
+  pl$period <- -(seq_len(nrow(pl)) + 1)   
+
+  ef <- as.data.frame(res$results$Effects)
+  ef$period <- seq_len(nrow(ef)) - 1       
+
+  names(pl)[names(pl) == "Estimate"] <- "est"
+  names(ef)[names(ef) == "Estimate"] <- "est"
+  names(pl)[names(pl) == "LB CI"]    <- "lb"
+  names(ef)[names(ef) == "LB CI"]    <- "lb"
+  names(pl)[names(pl) == "UB CI"]    <- "ub"
+  names(ef)[names(ef) == "UB CI"]    <- "ub"
+
+  df_plot <- bind_rows(
+    pl %>% select(period, est, lb, ub),
+    ef %>% select(period, est, lb, ub)
+  )
+
+  ggplot(df_plot, aes(x = period, y = est)) +
+    geom_hline(yintercept = 0, color = "grey50", linewidth = 0.3) +
+    geom_vline(xintercept = -0.5, linetype = "dashed", color = "red",
+               linewidth = 0.3) +
+    geom_errorbar(aes(ymin = lb, ymax = ub), width = 0.1, color = "navy") +
+    geom_point(color = "navy", size = 2) +
+    labs(title = title, x = "Periods since the event", y = y_label) +
+    theme_schaff
+}
+```
+
+# Introduction
+
+This reappraisal evaluates @schaff2024, who asks whether closed (oligarchic) political institutions caused higher wealth inequality in preindustrial Germany. The paper combines a panel of 33 cities (1500–1800) with a micro-level panel of taxpayer-year observations from Nördlingen (1579–1700), using the second to identify mechanisms behind the first. Identification at the individual level rests on a staggered, absorbing difference-in-differences design estimated with the heterogeneity-robust estimators of @decd2020 and @decd2024 (henceforth DCDH), supplemented by a triple-difference that exploits the Thirty Years' War (1618–1648) as a plausibly exogenous shock to magistrates' opportunities for self-enrichment.
+
+The paper's methodological contribution is non-trivial. The closest prior work on returns to public office [@eggers2009] relies on TWFE, which under staggered timing produces biased estimates of the ATT [@goodmanbacon2021]. @schaff2024 anticipates this by adopting the DCDH estimator throughout, reporting TWFE counterparts in his Online Appendix 5. This leaves unaddressed a complementary issue — sensitivity to parallel-trends violations [@rambachan2023] — which motivates @sec-contribution.
+
+Nördlingen's *Hasenräte* constitution^[Charles V imposed the constitution as punishment for Nördlingen's support of the Protestant Schmalkaldic League (1546–1547); it replaced guild-based government with a council of fifteen magistrates appointed by co-optation for life.] selected magistrates by co-optation for life, producing the clean staggered design exploited by the paper. I reproduce the main individual- and city-level results, document where the estimates depart from the published ones and why, and then probe the parallel-trends concern using the sensitivity framework of @rambachan2023, which the paper does not implement.
+
+# Research Design
+
+## Research Question
+
+The empirical question is: what is the causal effect of holding political office on personal wealth and the wealth distribution, in a closed (oligarchic) political system? 
+
+Three sub-questions follow: (i) does the macro-level association between closed structures and wealth concentration align with the micro-level office effect? (ii) was the effect amplified during the Thirty Years' War? (iii) which mechanism — compensation, business, patronage, or embezzlement — explains the enrichment?
+
+## Data {#sec-data}
+
+The author combines two hand-digitised datasets (construction details in his Online Appendix 1). The **city-level dataset** covers `r length(unique(df_city$IDlocality))` German cities at 25-year intervals between 1500 and 1800. Top wealth shares (10%, 5%, 1%) come from @schaff2022; the indicator for participatory council elections is coded from @keyser1939. Five additional controls capture conflict intensity, log population, epidemic incidence, Protestant Reformation introduction, and log distance to the nearest university.
+
+The **individual-level dataset** contains `r format(nrow(df_noe), big.mark = ",")` observations of `r format(length(unique(df_noe$ID)), big.mark = ",")` taxpayers across 22 unequally-spaced periods between 1579 and 1700 — irregular periodicity reflecting the historical schedule of Nördlingen's *Steuerregister*. Of these, `r n_magistrates` taxpayers eventually became magistrates. Variables include wealth outcomes (log wealth, percentile, top-5% indicator), treatments (council-membership, mayor, and city-clerk indicators), demographic controls, and mechanism variables (council-inheritance indicator, Thirty Years' War period indicator). The unit of analysis is the city-year (city panel) and the taxpayer-year (individual panel).
+
+## Identification Strategy {#sec-idstrategy}
+
+### Estimands and Specifications
+
+The **city-level analysis** estimates a TWFE regression on the 33-city dataset:
+
+$$
+I_{i,t} = \alpha_i + \pi_t + \beta\,\text{Election}_{i,t} + \gamma' X_{i,t} + \varepsilon_{i,t}
+$$ {#eq-city-twfe}
+
+where $I_{i,t}$ is a top wealth share in city $i$ at year $t$, $\alpha_i$ and $\pi_t$ are city and year fixed effects, $\text{Election}_{i,t}$ is a dummy for participatory elections, and $X_{i,t}$ contains the five controls listed in @sec-data. Standard errors are clustered at the city level. The treatment is non-absorbing — cities switch in and out of electoral systems — TWFE targets a weighted average of $2\times 2$ comparisons with potentially negative weights [@goodmanbacon2021; @decd2020], the author therefore treats these as conditional correlations rather than causal estimates; I discuss this further in @sec-limitations.
+
+The **individual-level analysis** is a staggered DiD on the Nördlingen panel, comparing wealth trajectories of taxpayers who eventually enter the council with those who never do:
+
+$$
+W_{i,t} = \alpha_i + \pi_t + \beta\,(\text{Council}_i \times \text{Post}_{i,t}) + \gamma' X_{i,t} + \varepsilon_{i,t}
+$$ {#eq-indiv-did}
+
+where $W_{i,t}$ is a wealth outcome (log wealth, wealth percentile, or top-5% indicator) measured at intervals of three to six years between 1585 and 1700, $\text{Council}_i = 1$ if individual $i$ ever joins the council, $\text{Post}_{i,t} = 1$ for periods at or after $i$ joins the council, and $X_{i,t}$ is a vector of time-varying covariates specified in three nested versions detailed below. The coefficient $\beta$ captures the ATT of council membership.^[Although @eq-indiv-did is written as a TWFE specification, it defines the *estimand* (ATT) rather than the regression actually run: the paper estimates the ATT with the @decd2020 estimator, which targets it via clean $2\times 2$ comparisons (each newly-treated taxpayer against the not-yet-treated cohort) rather than OLS.] 
+
+For each outcome, three nested versions of @eq-indiv-did are estimated — corresponding to the three columns of Schaff's @tbl-table3 — varying the content of $X_{i,t}$: (i) **Only FE:** $X_{i,t} = \emptyset$; (ii) **Baseline:** $X_{i,t} = (\text{ntaxpayments}, \text{ntaxpayments}^2)$, a life-cycle proxy; (iii) **Baseline + Controls:** further adds the `r length(occ_vars)` occupational dummies and a gender indicator.
+
+The *flexible (event-study) variant* estimates a separate coefficient for each event-time period:
+
+$$
+W_{i,t} = \alpha_i + \pi_t + \sum_{k=-2}^{7} \beta_k\,(\text{Council}_i \times \mathbf{1}\{\text{PeriodsToCouncil}_{i,t} = k\}) + \gamma' X_{i,t} + \varepsilon_{i,t}
+$$  {#eq-event-study}
+
+where $k$ indexes event time relative to council entry, $k=-1$ is the omitted reference, and the $\beta_k$ for $k < 0$ are placebo coefficients.^[The published equation (3) is notationally ambiguous: it reuses the calendar-time index $t$ as the summation index (clashing with $\pi_t$) and carries a single $\beta$ outside the sum, although the paper plots one coefficient per period and refers to "the betas" (p. 537). The printed range $-2,\ldots,7$ does not match the replication code: `did_multiplegt` is called with `placebo(3) dynamic(5)`, yielding 3 placebos and 5 dynamic effects. Figure 3 trims visually to $k=-3,-2$; I retain all 3 placebos in @fig-figure3 to inform the sensitivity analysis in @sec-contribution.]
+
+The **triple-difference design** for @tbl-table5 exploits the Thirty Years' War (1618-1646) as a quasi-exogenous shock:
+
+$$
+W_{i,t} = \alpha_i + \pi_t + \beta_1(\text{Council}_i \times \text{Post}_{i,t} \times \text{30YearsWar}_t) + \beta_2(\text{Council}_i \times \text{Post}_{i,t}) + \gamma' X_{i,t} + \varepsilon_{i,t}
+$$ {#eq-triple-diff}
+
+$\beta_1$ captures the additional war-period effect on top of the baseline office effect $\beta_2$. All individual-level specifications are estimated with the @decd2020 estimator on the relevant sample (full panel for @eq-indiv-did and @eq-event-study; 1603–1646 for @eq-triple-diff), with 100-replication block-bootstrap standard errors clustered at the household level.
+
+### Validating the Assumptions
+
+Causal identification rests on three assumptions.
+
+**1. Conditional parallel trends.** In the absence of treatment, the change in wealth between any two periods would have been the same, on average, for future magistrates as for non-magistrates, conditional on the time-varying covariates $X_{i,t}$.
+
+**2. No anticipation.** Future magistrates do not adjust their wealth-accumulation behaviour before entering the council. Formally, if $G_i$ denotes the period $i$ enters the council and $W^*_{i,t}(0)$ the potential wealth under control of an anticipator, the assumption requires $E[W_{i,t}(0) \mid G_i = g] = E[W^*_{i,t}(0) \mid G_i = g]$ for all $t < g$.
+
+**3. SUTVA.** *No-interference* requires that magistrate enrichment does not mechanically affect non-magistrates' wealth — non-trivial in Nördlingen, where 15 magistrates exercised lifetime control over a closed municipal budget, making the channels of enrichment (compensation, patronage, embezzlement) zero-sum with respect to the taxpayer base. *Treatment consistency* requires "entering the council" to be homogeneous, but tenure varies from years to decades and the role differs in peacetime vs. wartime. SUTVA is not discussed by the author; I return to it in @sec-limitations.
+
+# Main Results Replication
+
+The replication is implemented in `R`, translating the Stata `.do` file from @schaff2024's replication package. The principal command (`did_multiplegt` in Stata) maps to `DIDmultiplegtDYN::did_multiplegt_dyn()` in `R` — a related but not identical implementation, which produces small numerical discrepancies that I document where they arise. All heavy estimations are pre-computed in `replication.R` and loaded into this document from `output/*.rds`; see `README.md` for instructions.^[Three of the six event-study panels of Figure 3 and the "+ Controls" panels of Figures 4–6 require more memory than a 16 GB machine permits, owing to the 60-dimensional occupational control set combined with 100-replication clustered bootstrap. The estimation calls are included in `replication.R` but their outputs are not.]
+
+## Empirical Setup
+
+### Pre-treatment Characteristics of Future Magistrates (Table 1)
+
+@tbl-table1 compares the pre-office characteristics of future magistrates with those of the rest of the taxpaying population.
+
+Future magistrates were on average 2.5 log points wealthier (~12 times richer in levels) and scored 42 percentile points higher in the wealth distribution before entering office. They were significantly more likely to be city clerks, merchants, or in writing occupations, and significantly less likely to be women or wool weavers. This selection on observables is what motivates the author's DiD strategy: a naive post-treatment comparison would conflate the office effect with magistrates' pre-existing wealth advantage. DiD requires equality of trends, not balance in levels (@sec-idstrategy); @tbl-table1 here characterises the treatment group and quantifies the magnitude of self-selection — a concern revisited in @sec-limitations.
+
+```{r}
+#| label: tbl-table1
+#| tbl-cap: "Pre-treatment differences between future magistrates and the rest of the taxpaying population (replication of Schaff 2024, Table 1). Coefficients are from OLS regressions of each row variable on the time-invariant council-membership indicator, restricted to observations where the individual is not currently serving on the council. Standard errors (in parentheses) are from these OLS regressions. * p<0.10, ** p<0.05, *** p<0.01."
+
+# ---------------------------------------------------------------------------
+# Note on the pre-Council sample filter:
+# The original Stata code defines the pre-Council sample using a set of
+# periodstocouncil_pX dummies that are referenced but not included in the
+# replication .dta file distributed via ICPSR. I approximate the filter
+# using councilmemberterm == 0, which yields the same direction and
+# magnitude for all coefficients reported below but admits a slightly larger
+# sample for future magistrates in their pre-entry years.
+# ---------------------------------------------------------------------------
+
+df_pre <- df_noe %>% filter(councilmemberterm == 0)
+
+vars_balance <- c("logwealth", "wealthpercentile", "top5percent",
+                  "ntaxpayments", "womentaxpayer", "cityadmin_f",
+                  "occupation_500", "occupation_640",
+                  "occupation_900", "occupation_100")
+
+get_balance_row <- function(var) {
+  fml <- as.formula(paste(var, "~ councilmember_tinvar"))
+  m   <- lm(fml, data = df_pre)
+  tibble(
+    variable = var,
+    diff     = coef(m)["councilmember_tinvar"],
+    se       = sqrt(vcov(m)["councilmember_tinvar", "councilmember_tinvar"]),
+    p_value  = summary(m)$coefficients["councilmember_tinvar", "Pr(>|t|)"],
+    mean_all = mean(df_pre[[var]], na.rm = TRUE)
+  )
+}
+
+tab1 <- purrr::map_dfr(vars_balance, get_balance_row)
+
+labels_tab1 <- c(
+  logwealth        = "Wealth (Log) pre council",
+  wealthpercentile = "Wealth percentile pre council",
+  top5percent      = "Top 5 percent pre council",
+  ntaxpayments     = "Nr. of tax payments pre council",
+  womentaxpayer    = "Share of women pre council",
+  cityadmin_f      = "City clerk pre council",
+  occupation_500   = "Merchant pre council",
+  occupation_640   = "Writing occupation pre council",
+  occupation_900   = "Without occupation (Wealth > 1 fl.) pre council",
+  occupation_100   = "Wool weaver pre council"
+)
+
+tab1 %>%
+  mutate(
+    stars = case_when(
+      p_value < 0.01 ~ "***",
+      p_value < 0.05 ~ "**",
+      p_value < 0.10 ~ "*",
+      TRUE           ~ ""
+    ),
+    diff_se = paste0(formatC(diff, digits = 2, format = "f"), stars,
+                     " (", formatC(se, digits = 2, format = "f"), ")"),
+    mean_all = formatC(mean_all, digits = 2, format = "f"),
+    variable_label = labels_tab1[variable]
+  ) %>%
+  transmute(
+    Variable                  = variable_label,
+    `Diff (treat - rest)`     = diff_se,
+    `Mean (all pre-Council)`  = mean_all
+  ) %>%
+  gt() %>%
+  cols_align(align = "left", columns = Variable) %>%
+  cols_align(align = "center", columns = -Variable) %>%
+  tab_options(
+    table.font.size = px(12),
+    column_labels.font.weight = "bold",
+    column_labels.border.bottom.width = px(2)
+  )
+```
+
+### City-Level Association: cities with vs. without elections (Table 2)
+
+@tbl-table2 reports the TWFE panel regression of @eq-city-twfe: a city-level association between political openness and wealth concentration across 33 cities.
+
+```{r}
+#| label: tbl-table2
+#| tbl-cap: "Top wealth shares and council elections across 33 German cities, 1500-1800 (replication of Schaff 2024, Table 2). Cluster-robust standard errors at the city level in parentheses. * p<0.1, ** p<0.05, *** p<0.01."
+
+# ----------------------------------------------------------------------------
+# Manual within-FE estimator matching Stata `xtreg, fe vce(cluster)` exactly.
+# Demeans y and X by IDlocality, includes yearineq25 dummies in X, computes
+# cluster-robust SEs with Stata's small-sample correction, and reports the
+# within-R² as 1 - SSR/SST_demeaned (Stata convention). fixest::feols does not
+# reproduce Stata's within-R² out of the box, so the estimator is rewritten
+# from scratch to match the published Table 2 exactly.
+# ----------------------------------------------------------------------------
+
+run_city_fe <- function(data, y, controls = character()) {
+  vars <- c(y, "electionparticipation", controls, "yearineq25", "IDlocality")
+  d <- data[, vars] |> na.omit()
+  d$yearineq25 <- factor(d$yearineq25)
+
+  rhs <- c("electionparticipation", controls, "yearineq25")
+  X <- model.matrix(
+    as.formula(paste("~", paste(rhs, collapse = " + "))),
+    data = d
+  )
+  X <- X[, colnames(X) != "(Intercept)", drop = FALSE]
+
+  id    <- d$IDlocality
+  y_raw <- as.numeric(d[[y]])
+
+  # Demean by city FE
+  y_dm <- y_raw - ave(y_raw, id, FUN = mean)
+  X_dm <- apply(X, 2, function(z) z - ave(z, id, FUN = mean))
+  X_dm <- as.matrix(X_dm)
+
+  fit  <- lm.fit(x = X_dm, y = y_dm)
+  beta <- coef(fit)
+  u    <- residuals(fit)
+
+  # Cluster-robust variance with Stata's small-sample correction
+  XtX_inv <- solve(crossprod(X_dm))
+  meat    <- matrix(0, ncol(X_dm), ncol(X_dm))
+  for (g in unique(id)) {
+    idx <- id == g
+    xu  <- crossprod(X_dm[idx, , drop = FALSE], u[idx])
+    meat <- meat + xu %*% t(xu)
+  }
+
+  G <- length(unique(id))
+  N <- nrow(d)
+  K <- ncol(X_dm) + 1                                # Stata counts the constant
+  stata_correction <- (G / (G - 1)) * ((N - 1) / (N - K))
+  V  <- stata_correction * XtX_inv %*% meat %*% XtX_inv
+  se <- sqrt(diag(V))
+
+  tibble(
+    outcome   = y,
+    controls  = length(controls) > 0,
+    beta      = beta["electionparticipation"],
+    se        = se["electionparticipation"],
+    N         = N,
+    cities    = G,
+    within_r2 = 1 - sum(u^2) / sum(y_dm^2),
+    mean_y    = mean(y_raw)
+  )
+}
+
+# Run the six regressions reported in the paper's Table 2
+controls_city <- c("conflict25", "logpopulation", "epidemic",
+                   "reformationintro", "loguniversitydist")
+
+t2 <- dplyr::bind_rows(
+  run_city_fe(df_city, "D10"),
+  run_city_fe(df_city, "D10",  controls_city),
+  run_city_fe(df_city, "Top5"),
+  run_city_fe(df_city, "Top5", controls_city),
+  run_city_fe(df_city, "Top1"),
+  run_city_fe(df_city, "Top1", controls_city)
+)
+
+# Significance stars based on cluster-robust t-stats with Stata's df = G - 1
+t2 <- t2 %>%
+  mutate(
+    t_stat   = beta / se,
+    p_val    = 2 * pt(-abs(t_stat), df = cities - 1),
+    stars    = case_when(
+      p_val < 0.01 ~ "***",
+      p_val < 0.05 ~ "**",
+      p_val < 0.10 ~ "*",
+      TRUE         ~ ""
+    ),
+    coef_fmt = sprintf("%.3f%s", beta, stars),
+    se_fmt   = sprintf("(%.3f)", se)
+  )
+
+# Build paper-style table manually (matches order of Schaff 2024, Table 2)
+t2_display <- tibble::tibble(
+  Variable = c("Council elections", "", "Controls", "City FE", "Time FE",
+               "Observations", "Cities", "R² (within)", "Mean of DV"),
+  `Top 10% (no ctrl)` = c(t2$coef_fmt[1], t2$se_fmt[1], "No",
+                          "Yes", "Yes",
+                          as.character(t2$N[1]), as.character(t2$cities[1]),
+                          sprintf("%.3f", t2$within_r2[1]),
+                          sprintf("%.2f", t2$mean_y[1])),
+  `Top 10% (w/ ctrl)` = c(t2$coef_fmt[2], t2$se_fmt[2], "Yes",
+                          "Yes", "Yes",
+                          as.character(t2$N[2]), as.character(t2$cities[2]),
+                          sprintf("%.3f", t2$within_r2[2]),
+                          sprintf("%.2f", t2$mean_y[2])),
+  `Top 5% (no ctrl)`  = c(t2$coef_fmt[3], t2$se_fmt[3], "No",
+                          "Yes", "Yes",
+                          as.character(t2$N[3]), as.character(t2$cities[3]),
+                          sprintf("%.3f", t2$within_r2[3]),
+                          sprintf("%.2f", t2$mean_y[3])),
+  `Top 5% (w/ ctrl)`  = c(t2$coef_fmt[4], t2$se_fmt[4], "Yes",
+                          "Yes", "Yes",
+                          as.character(t2$N[4]), as.character(t2$cities[4]),
+                          sprintf("%.3f", t2$within_r2[4]),
+                          sprintf("%.2f", t2$mean_y[4])),
+  `Top 1% (no ctrl)`  = c(t2$coef_fmt[5], t2$se_fmt[5], "No",
+                          "Yes", "Yes",
+                          as.character(t2$N[5]), as.character(t2$cities[5]),
+                          sprintf("%.3f", t2$within_r2[5]),
+                          sprintf("%.2f", t2$mean_y[5])),
+  `Top 1% (w/ ctrl)`  = c(t2$coef_fmt[6], t2$se_fmt[6], "Yes",
+                          "Yes", "Yes",
+                          as.character(t2$N[6]), as.character(t2$cities[6]),
+                          sprintf("%.3f", t2$within_r2[6]),
+                          sprintf("%.2f", t2$mean_y[6]))
+)
+
+t2_display %>%
+  gt::gt() %>%
+  gt::cols_align(align = "left",   columns = Variable) %>%
+  gt::cols_align(align = "center", columns = -Variable) %>%
+  gt::tab_options(
+    table.font.size           = gt::px(11),
+    column_labels.font.weight = "bold",
+    column_labels.border.bottom.width = gt::px(2)
+  )
+```
+
+Cities with participatory council elections had top wealth shares 4–6 percentage points lower than cities without, with the largest absolute effect on the top 5% share. Point estimates, standard errors, and within-R² values replicate the published Table 2 to the third decimal across all six columns. As discussed in @sec-idstrategy, these are conditional correlations rather than causal effects given non-absorbing treatment, and serve only as motivation for the individual-level analysis that follows.
+
+## Main causal estimate: the office effect
+
+The main causal claim is identified at the individual level, where the treatment — entry into the city council — is staggered and absorbing. @tbl-table3 reports the ATT under the @decd2020 estimator, and @fig-figure3 traces its dynamic profile to probe the parallel-trends assumption.
+
+### Individual-Level DiD (Table 3)
+
+@tbl-table3 reports the main DiD estimates of the effect of council membership on personal wealth.
+
+```{r}
+#| label: tbl-table3
+#| tbl-cap: "Effect of council membership on personal wealth (replication of Schaff 2024, Table 3). Estimator: de Chaisemartin and D'Haultfœuille (2020, 2022) with 100-replication clustered bootstrap."
+
+results_t3 <- lapply(0:8, function(i) {
+  readRDS(file.path(out_dir, sprintf("dCdH_simpleDiD_%d.rds", i)))
+})
+
+labels_t3 <- list(
+  list(y = "ln-Wealth",         label = "Only FE"),
+  list(y = "ln-Wealth",         label = "Baseline"),
+  list(y = "ln-Wealth",         label = "Baseline + Controls"),
+  list(y = "Percentile",        label = "Baseline"),
+  list(y = "Percentile",        label = "Baseline + Controls"),
+  list(y = "Top 5%",            label = "Baseline"),
+  list(y = "Top 5%",            label = "Baseline + Controls"),
+  list(y = "ln-Wealth (mayor)", label = "Baseline"),
+  list(y = "ln-Wealth (mayor)", label = "Baseline + Controls")
+)
+
+tab3 <- purrr::map2_dfr(
+  results_t3, labels_t3,
+  ~ extract_dcdh_summary(.x, label_y = .y$y, label_spec = .y$label)
+)
+tab3$Nr <- seq_len(nrow(tab3))
+tab3 <- tab3 %>% select(Nr, Outcome, Specification, ATT, SE,
+                        Up_95_CI, Lo_95_CI, N)
+
+tab3 %>%
+  gt() %>%
+  tab_row_group(label = "Treatment: Mayor x Post",          rows = 8:9) %>%
+  tab_row_group(label = "Treatment: Council member x Post", rows = 1:7) %>%
+  cols_align(align = "center", columns = -c(Outcome, Specification)) %>%
+  cols_align(align = "left",   columns = c(Outcome, Specification)) %>%
+  tab_options(
+    table.font.size = px(12),
+    column_labels.font.weight = "bold",
+    column_labels.border.bottom.width = px(2)
+  )
+```
+
+The replication reproduces the direction, significance, and broad magnitude of the published estimates. Council membership is associated with substantial wealth gains: an ATT of ~0.40 log points (Baseline) on log wealth, 2–3 percentile points on wealth rank, and 9–10 percentage points on top-5% membership. Mayors experience additional wealth gains beyond the ordinary council effect, with my Mayor estimates (rows 8–9) reproducing the published ATTs of 0.302 and 0.339 to the third decimal.
+
+The Council estimates (rows 1–5) are systematically smaller than the published values — the ln-wealth Baseline ATT is 0.396 (SE 0.108) here versus 0.526 (SE 0.162) in @schaff2024 — and my analysis sample is 16,110 versus 16,315 observations (a 1.3% gap). The discrepancy concentrates in outcomes with more missing data (`wealthpercentile` shows the largest gap, `top5percent` essentially none) and disappears in the Mayor specifications, which use a balanced sub-sample (9,727 observations identical to the paper). The pattern suggests the divergence reflects how `did_multiplegt` (Stata) and `did_multiplegt_dyn` (R) handle missing observations in unbalanced panels rather than an algorithmic difference. The substantive conclusions — direction, significance, relative magnitudes — replicate cleanly.
+
+## Dynamics and Pre-trends
+
+@fig-figure3 traces the dynamic effects of council membership across event time, replicating the Baseline panels of Figure 3 of @schaff2024.^[The "+ Controls" panels of Figure 3 (Panels A.II, B.II, C.II) are computationally demanding: the 60 occupational dummies combined with 100-replication bootstrap exceed the memory available on a 16 GB machine. The estimation code is included in `replication.R`. The figure also retains all three placebos returned by the `placebo(3)` option in @schaff2024's `did_multiplegt` call, whereas the published figure trims visually to two via `trimlead(2)`; this allows the @rambachan2023 sensitivity analysis in @sec-contribution to use the full set of pre-period coefficients.]
+
+```{r}
+#| label: fig-figure3
+#| fig-cap: "Event-study estimates of council-membership effects, Baseline specifications (replication of Schaff 2024, Figure 3 Panels A.I, B.I, C.I). Vertical dashed line: treatment onset. 95% confidence intervals from 100-replication clustered bootstrap."
+#| fig-width: 11
+#| fig-height: 4
+
+# ---------------------------------------------------------------------------
+# Computational reproducibility note:
+# The "+ Controls" panels of Figure 3 (A.II, B.II, C.II) are not included.
+# The full set of controls comprises:
+#   - ntaxpayments + ntaxpayments^2 (life-cycle proxy)
+#   - 61 occupational dummies
+#   - gender indicator
+# Running did_multiplegt_dyn with this specification + 100-replication
+# clustered bootstrap exceeds available memory (32+ GB tested) due to memory
+# accumulation in the polars backend that the package relies on.
+#
+# Three alternative installation paths were tested:
+#   (1) DIDmultiplegt CRAN wrapper: imports DIDmultiplegtDYN, shares memory issue
+#   (2) did_multiplegt_old mode: not designed for event-study with non-absorbing
+#       treatments; returns NA for all coefficients in this application
+#   (3) GitHub development version: failed to compile (C++20 compiler required)
+# 
+# The estimation code for these panels is preserved in replication.R for
+# execution on a Stata-equipped environment with sufficient memory.
+# ---------------------------------------------------------------------------
+
+fig3_logwealth_base <- readRDS(file.path(out_dir, "fig3_logwealth_base.rds"))
+fig3_pct_base       <- readRDS(file.path(out_dir, "fig3_pct_base.rds"))
+fig3_top5_base      <- readRDS(file.path(out_dir, "fig3_top5_base.rds"))
+
+p1 <- plot_event_dcdh(fig3_logwealth_base,
+                      title = "A.I. Baseline",
+                      y_label = "Treatment effect (ln-wealth)")
+p2 <- plot_event_dcdh(fig3_pct_base,
+                      title = "B.I. Baseline",
+                      y_label = "Treatment effect (wealth percentile)")
+p3 <- plot_event_dcdh(fig3_top5_base,
+                      title = "C.I. Baseline",
+                      y_label = "Treatment effect (top 5%)")
+
+p1 | p2 | p3
+```
+
+In the ln-wealth panel (A.I), all three pre-treatment coefficients are negative and statistically significant ($\hat\beta_{-4} \approx -0.51$; $\hat\beta_{-3} \approx -0.48$; $\hat\beta_{-2} \approx -0.30$), comparable in absolute magnitude to the post-treatment ATT. The author acknowledges only the closest placebo ($k=-2$) and attributes it to magistrates' prior service on the city court (p. 537), but Figure 3 of the paper trims to two placebos via `trimlead(2)`; retaining the third reveals a monotonic pre-trend deeper than the paper documents. Panels B.I and C.I show non-zero placebos in the same direction with wider confidence intervals — including a significant $k=-4$ in C.I. The pre-trend is not confined to ln-wealth: future magistrates were moving differentially across multiple wealth dimensions before entry, with the strongest signal in absolute wealth. Parallel trends — the core assumption of the DCDH estimator (@sec-idstrategy) — appears violated in ln-wealth and questionable in positional outcomes. The @rambachan2023 sensitivity exercise in @sec-contribution quantifies how large the post-treatment violation would have to be to overturn the conclusion.
+
+## Mechanism Tests (Table 4 and Figure 4)
+
+The paper discriminates among four candidate channels of magistrate enrichment: dynastic inheritance, business opportunities, patronage, and formal compensation.
+
+```{r}
+#| label: tbl-table4
+#| tbl-cap: "Mechanisms behind magistrate enrichment: inheritance, merchants, and city clerks (replication of Schaff 2024, Table 4). Estimator: de Chaisemartin and D'Haultfœuille (2020, 2022) with 100-replication clustered bootstrap. Outcome: ln-wealth."
+
+results_t4 <- lapply(1:8, function(i) {
+  readRDS(file.path(out_dir, sprintf("dCdH_t4_spec_%d.rds", i)))
+})
+
+labels_t4 <- list(
+  list(y = "ln-Wealth", label = "Baseline"),
+  list(y = "ln-Wealth", label = "Baseline + Controls"),
+  list(y = "ln-Wealth", label = "Nr. 1 + Council inherit"),
+  list(y = "ln-Wealth", label = "Nr. 2 + Council inherit"),
+  list(y = "ln-Wealth", label = "Baseline"),
+  list(y = "ln-Wealth", label = "Baseline + Controls"),
+  list(y = "ln-Wealth", label = "Baseline"),
+  list(y = "ln-Wealth", label = "Baseline + Controls")
+)
+
+tab4 <- purrr::map2_dfr(
+  results_t4, labels_t4,
+  ~ extract_dcdh_summary(.x, label_y = .y$y, label_spec = .y$label)
+)
+tab4$Nr <- seq_len(nrow(tab4))
+tab4 <- tab4 %>% select(Nr, Outcome, Specification, ATT, SE,
+                        Up_95_CI, Lo_95_CI, N)
+
+tab4 %>%
+  gt() %>%
+  tab_row_group(label = "Treatment: City clerk x Post",                  rows = 7:8) %>%
+  tab_row_group(label = "Treatment: Council member x Post x Merchant",   rows = 5:6) %>%
+  tab_row_group(label = "Treatment: Council member x Post",               rows = 3:4) %>%
+  tab_row_group(label = "Treatment: Council member x Post x Council inherit", rows = 1:2) %>%
+  cols_align(align = "center", columns = -c(Outcome, Specification)) %>%
+  cols_align(align = "left",   columns = c(Outcome, Specification)) %>%
+  tab_options(
+    table.font.size = px(12),
+    column_labels.font.weight = "bold",
+    column_labels.border.bottom.width = px(2)
+  )
+```
+
+Inheritance (rows 1–2) is statistically indistinguishable from zero, ruling out dynastic transmission. The merchant interaction (rows 5–6) is also insignificant, weakening the business-opportunities hypothesis. The city-clerk effect (rows 7–8) is large, positive, and significant: clerks experienced wealth gains comparable to magistrates themselves despite never sitting on the council — evidence the author reads as rent-sharing (patronage).^[The author treats the clerk treatment as artificially absorbing to keep DCDH's "switcher" comparisons clean (@schaff2024, footnote 12). This redefines the estimand: the ATT for clerks captures the cumulative effect of having served, not the instantaneous effect of currently serving.]
+
+```{r}
+#| label: fig-figure4
+#| fig-cap: "Event-study estimates of becoming a city clerk on ln-wealth (replication of Schaff 2024, Figure 4 Panel A.I)."
+#| fig-width: 6
+#| fig-height: 4
+
+fig4_base <- readRDS(file.path(out_dir, "fig4_base.rds"))
+
+plot_event_dcdh(fig4_base,
+                title   = "A.I. City clerks, Baseline",
+                y_label = "Treatment effect (ln-wealth)")
+```
+
+@fig-figure4 confirms the clerk effect accumulates gradually post-entry with no significant pre-trend — a cleaner identification profile than @fig-figure3 since the prior-court-service concern does not extend to clerks.
+
+## Robustness: The Thirty Years' War Shock
+
+The Thirty Years' War (1618–1646) provides a shock to magistrates' rent-extraction opportunities arguably unrelated to their individual characteristics. @tbl-table5 reports the triple-difference ATT on the restricted sample 1603–1646; @fig-figure5 traces its dynamic profile; @fig-figure6 examines the parallel patronage channel through city clerks.
+
+```{r}
+#| label: tbl-table5
+#| tbl-cap: "Triple-difference estimates of Council × Post × War (replication of Schaff 2024, Table 5). Estimator: de Chaisemartin and D'Haultfœuille (2020, 2022) with 100-replication clustered bootstrap. Sample: 1603–1646."
+
+
+results_t5 <- lapply(1:7, function(i) {
+  readRDS(file.path(out_dir, sprintf("dCdH_t5_spec_%d.rds", i)))
+})
+
+labels_t5 <- list(
+  list(y = "ln-Wealth",  label = "Only FE"),
+  list(y = "ln-Wealth",  label = "Baseline"),
+  list(y = "ln-Wealth",  label = "Baseline + Controls"),
+  list(y = "Percentile", label = "Baseline"),
+  list(y = "Percentile", label = "Baseline + Controls"),
+  list(y = "Top 5%",     label = "Baseline"),
+  list(y = "Top 5%",     label = "Baseline + Controls")
+)
+
+tab5 <- purrr::map2_dfr(
+  results_t5, labels_t5,
+  ~ extract_dcdh_summary(.x, label_y = .y$y, label_spec = .y$label)
+)
+tab5$Nr <- seq_len(nrow(tab5))
+tab5 <- tab5 %>% select(Nr, Outcome, Specification, ATT, SE,
+                        Up_95_CI, Lo_95_CI, N)
+
+tab5 %>%
+  gt() %>%
+  cols_align(align = "center", columns = -c(Outcome, Specification)) %>%
+  cols_align(align = "left",   columns = c(Outcome, Specification)) %>%
+  tab_options(
+    table.font.size = px(12),
+    column_labels.font.weight = "bold",
+    column_labels.border.bottom.width = px(2)
+  )
+```
+
+Wealth gains from council membership were amplified substantially during the war: the Baseline specification (row 2) yields an additional 0.42 log points on top of the peace-time office effect, rising to 0.57 with controls (row 3). Replication is closer than for @tbl-table3 — point estimates differ from the published values by 0.02–0.20 across all seven rows, and the sample (3,339 vs 3,354) differs by only 0.4%, reflecting the more balanced 1603–1646 window. The "exogeneity" of the war as a shock to enrichment is, however, partial: it opened multiple channels simultaneously (emergency taxation, requisitioning, exemptions, credit access), and the triple-difference cannot disentangle them. What is identified is the differential wealth trajectory of officeholders during a period of mechanically expanded discretion, not specifically "enrichment from office" — a bundled-treatment concern discussed further in @sec-limitations.
+
+```{r}
+#| label: fig-figure5
+#| fig-cap: "Event-study estimates of Council × Post × War (replication of Schaff 2024, Figure 5 Panels A.I, B.I). All three placebos returned by the `placebo(3)` specification are retained; the published figure trims to two via `trimlead(2)`."
+#| fig-width: 8
+#| fig-height: 4
+
+fig5_logw_base <- readRDS(file.path(out_dir, "fig5_logw_base.rds"))
+fig5_pct_base  <- readRDS(file.path(out_dir, "fig5_pct_base.rds"))
+
+p5a <- plot_event_dcdh(fig5_logw_base,
+                       title   = "A.I. Baseline (war x council)",
+                       y_label = "Treatment effect (ln-wealth)")
+p5b <- plot_event_dcdh(fig5_pct_base,
+                       title   = "B.I. Baseline (war x council)",
+                       y_label = "Treatment effect (wealth percentile)")
+p5a | p5b
+```
+
+Post-treatment effects accumulate gradually and peak around four periods post-onset, but the pre-treatment placebos in Panel A.I are not uniformly null: $\hat\beta_{-4} \approx -0.70$ with CI $[-1.1, -0.4]$ is statistically significant. The published Figure 5 trims visually to $k=-3,-2$ via `trimlead(2)`; retaining the third placebo shows that the parallel-trends assumption of the triple-difference is itself questionable in the more distant pre-period.
+
+```{r}
+#| label: fig-figure6
+#| fig-cap: "Event-study estimates of becoming a city clerk during the Thirty Years' War (replication of Schaff 2024, Figure 6 Panel A). Sample: 1603-1646."
+#| fig-width: 6
+#| fig-height: 4
+
+fig6_base <- readRDS(file.path(out_dir, "fig6_base.rds"))
+
+plot_event_dcdh(fig6_base,
+                title   = "City clerks during the Thirty Years' War, Baseline",
+                y_label = "Treatment effect (ln-wealth)")
+```
+
+@fig-figure6 traces the same exercise for clerks: post-treatment effects rise substantially during the war (peak at $k=3$, coef ≈ 2.2), mirroring @fig-figure5 and supporting the patronage interpretation. The clerk pre-trend is non-trivial at $k=-3$ (coef ≈ −0.25) though noisier, in line with the smaller treated group.
+
+# Critical Reappraisal {#sec-limitations}
+
+The paper's three central findings reproduce: the city-level association (@tbl-table2), the individual-level office effect (@tbl-table3), and its wartime amplification (@tbl-table5). The patronage channel (@tbl-table4, @fig-figure4) emerges as the best-supported mechanism. One pattern, however, emerges from this reappraisal that the published paper does not document. In each of the three event-studies (@fig-figure3, @fig-figure5, @fig-figure6), @schaff2024 calls `did_multiplegt` with `placebo(3) dynamic(5)` but the published figures display only $k=-3,-2$ via `trimlead(2)`. Retaining the third placebo reveals a consistent pattern of negative, statistically significant pre-treatment coefficients in the most distant pre-period — for the council main result ($\hat\beta_{-4} \approx -0.51$), the war × council interaction ($\hat\beta_{-4} \approx -0.70$), and the clerk dynamics ($\hat\beta_{-4} \approx -0.25$). The pre-trend the author acknowledges only at $k=-2$ (p. 537) is therefore deeper and more systematic than the published analysis suggests, motivating the formal sensitivity exercise in @sec-contribution.
+
+## Research Design
+
+**Pre-trends and No-Anticipation.** The placebos in Panel A.I of @fig-figure3 are comparable in absolute magnitude to the post-treatment ATT ($\hat\beta_0 \approx 0.40$). The author attributes them to magistrates' prior court service, but pre-trend tests have low power and a significant placebo does not by itself signal the direction of post-treatment bias [@rambachan2023]. The pattern appears most clearly in *level* outcomes (ln-wealth) and weaker in *positional* outcomes (percentile, top 5%) — consistent with the prior-court-service interpretation but not exclusive of differential life-cycle accumulation.
+
+**SUTVA.** *No-interference* is plausibly violated through two opposing channels: if magistrate enrichment came at the expense of the city treasury, controls were *paying for* treated gains (upward bias); if magistrates engaged in rent-sharing with allies, controls were partially "treated" by spillover (downward bias). The clerk effect in @tbl-table4 and @fig-figure6 is direct evidence the second channel operates. *Consistency* is also strained: council service is heterogeneous in duration (years to decades), role, and historical period (peace vs. war), yet treated identically by the estimator. SUTVA is not discussed in the paper.
+
+## Measurement
+
+The wealth coding $\ln(\text{wealth} + 0.1)$ preserves zero-wealth observations but the choice of $c = 0.1$ is consequential: changing it shifts the level of every coefficient and, because parallel trends is not invariant to nonlinear transformations of the outcome, also shifts the pre-trend. The author shows the conclusions are stable across alternative codings (Online Appendix 5) but does not test whether the pre-trend itself is sensitive to $c$ — leaving open whether the documented violation is a feature of the underlying data or an artifact of the chosen transformation.
+
+## Estimation
+
+**City-level TWFE with non-absorbing treatment.** @eq-city-twfe cannot be read causally: the TWFE coefficient is a weighted average of $2\times 2$ comparisons with potentially negative weights [@goodmanbacon2021], and none of the recent heterogeneity-robust alternatives [@callaway2021; @sun2021; @borusyak2024; @decd2024] fully accommodate non-absorbing treatment. The paper integrates the city-level results into the causal narrative; a more cautious framing would treat them as motivating correlations.
+
+**Single-estimator analysis.** The individual-level analysis relies on the DCDH estimator. The lecture material highlights @callaway2021 as the canonical "flexible matching and re-weighting" alternative; the two estimators belong to the same family and would not be expected to yield qualitatively different ATTs.^[The differences relevant to Nördlingen are technical: @callaway2021 builds cohort-specific ATTs using *long differences* against the never-treated, whereas DCDH uses *first differences* with not-yet-treated comparisons. With Nördlingen's small cohorts (typically one to three new magistrates per year), cohort-specific estimates under @callaway2021 would carry substantial sampling variance, making a direct horse-race uninformative.] The author's Online Appendix 5 compares DCDH against conventional TWFE; what is not assessed is sensitivity to assumed parallel trends — the gap addressed in @sec-contribution.
+
+**Reproducibility across software platforms.** Four technical obstacles complicate full reproduction in R: (i) the Stata command used by the author is superseded by its developers [@decd2024]; (ii) the R and Stata implementations differ in their handling of missing observations, producing systematic sample-size gaps (e.g., 16,110 vs 16,315 in @tbl-table3); (iii) the R backend (`polars`) accumulates memory when running high-dimensional control specifications, causing "+ Controls" panels of @fig-figure3 to fail even on 32+ GB machines; (iv) alternative installation paths (`DIDmultiplegt` CRAN wrapper, `did_multiplegt_old` mode, GitHub development version) each fail in this setting for distinct reasons documented in the code appendix. The substantive implication is that the "+ Controls" specifications cannot in practice be verified by researchers without Stata access — a concern about *accessibility* and *verifiability* of empirical results, distinct from the validity of the headline findings.
+
+# Contribution {#sec-contribution}
+
+The event-study evidence in @fig-figure3 documents pre-treatment placebos that are negative and statistically significant across all three pre-periods. This raises a question the paper does not formally address: how large would the parallel-trends violation have to be to overturn the conclusion that council membership increased wealth?
+
+@rambachan2023 propose bounding the bias of the DiD estimator under restricted classes of parallel-trends violations and producing "robust" confidence intervals valid under those restrictions. The *relative magnitudes* variant constrains the post-treatment differential trend to be at most $\bar M$ times the maximum observed pre-treatment violation; the **breakdown $\bar M$** is the largest value at which the robust CI still excludes zero. Higher breakdown values indicate stronger robustness.^[@rambachan2023 is designed for event-studies estimated by OLS/TWFE. The bootstrap-based vcov produced by `did_multiplegt_dyn` is approximately diagonal and is not suitable input. I therefore estimate the event-study via two-way fixed effects with `fixest::feols()` and apply the sensitivity analysis to that estimate — the same TWFE specification @schaff2024 reports in his Online Appendix 5.]
+
+```{r}
+#| label: fig-honestdid
+#| fig-cap: "DiD sensitivity analysis (Rambachan and Roth 2023, relative magnitudes) applied to a TWFE event-study of ln-wealth, k=-4 to k=4. Red intervals are 95% robust CIs on the ATT at k=0 under the restriction that the post-treatment violation of parallel trends is at most $\\bar M$ times the largest observed pre-treatment violation. The blue interval is the conventional (non-robust) CI. The breakdown value is reached between $\\bar M = 0$ and $\\bar M = 0.25$, indicating the conclusion is fragile to even modest violations of parallel trends."
+#| fig-width: 7
+#| fig-height: 4.5
+#| message: false
+#| warning: false
+
+# ---------------------------------------------------------------------------
+# The Rambachan-Roth (2023) sensitivity procedure  requires a TWFE event-study 
+# with a non-diagonal vcov. I estimate the same event-study as 
+# Figure 3 Panel A.I but with two-way FE(the specification reported by 
+# Schaff in Online Appendix Table A5.1) so the residuals carry the correlations 
+# across event-times that did_multiplegt_dyn discards. 
+# The point estimates differ slightly from the DCDH baseline; what
+# matters here is the sensitivity profile, not the level of the ATT.
+# ---------------------------------------------------------------------------
+
+# Build event-time variable: k = periodID - first_council_period
+# Cap at [-4, +4] to match Figure 3's range; bin extremes.
+df_es <- df_noe %>%
+  group_by(ID) %>%
+  mutate(
+    first_council = if (any(councilmemberterm == 1, na.rm = TRUE)) {
+      min(periodID[councilmemberterm == 1], na.rm = TRUE)
+    } else {
+      NA_real_
+    }
+  ) %>%
+  ungroup() %>%
+  mutate(
+    event_time   = ifelse(is.na(first_council), NA_real_,
+                          periodID - first_council),
+    # Bin endpoints to avoid extreme event-times with few observations
+    event_time_b = case_when(
+      is.na(event_time)     ~ -1L,            # never-treated = reference
+      event_time <= -4       ~ -4L,
+      event_time >=  4       ~  4L,
+      TRUE                   ~ as.integer(event_time)
+    ),
+    # k = -1 is the omitted reference; never-treated also pooled with k=-1
+    event_time_b = factor(event_time_b, levels = c(-1, -4, -3, -2, 0, 1, 2, 3, 4))
+  )
+
+# Estimate TWFE event-study
+es_twfe <- feols(
+  logwealth ~ event_time_b + ntaxpayments + I(ntaxpayments^2) |
+    ID + periodID,
+  data    = df_es,
+  cluster = ~ ID
+)
+
+# Extract betahat and sigma in the order HonestDiD expects:
+# pre-periods first (most distant to closest), then post-periods (k=0 to k=4)
+event_names <- c("event_time_b-4", "event_time_b-3", "event_time_b-2",
+                 "event_time_b0",  "event_time_b1",  "event_time_b2",
+                 "event_time_b3",  "event_time_b4")
+
+betahat <- coef(es_twfe)[event_names]
+sigma   <- vcov(es_twfe)[event_names, event_names]
+
+# Sanity check: vcov has non-trivial off-diagonal elements
+off_diag <- sigma[lower.tri(sigma)]
+stopifnot(max(abs(off_diag)) > 0)
+
+# Apply Rambachan-Roth sensitivity with relative-magnitudes restriction
+sens_log <- HonestDiD::createSensitivityResults_relativeMagnitudes(
+  betahat        = betahat,
+  sigma          = sigma,
+  numPrePeriods  = 3,
+  numPostPeriods = 5,
+  Mbarvec        = seq(0, 2, by = 0.25)
+)
+
+# Original (non-robust) CI for benchmark
+orig_ci <- HonestDiD::constructOriginalCS(
+  betahat        = betahat,
+  sigma          = sigma,
+  numPrePeriods  = 3,
+  numPostPeriods = 5
+)
+
+# Plot
+HonestDiD::createSensitivityPlot_relativeMagnitudes(
+  robustResults   = sens_log,
+  originalResults = orig_ci
+) +
+  labs(
+    x = expression(bar(M)),
+    y = "95% CI on ATT at k=0 (ln-wealth)",
+    color = NULL
+  ) +
+  theme_schaff +
+  theme(legend.position = "bottom")
+```
+
+@fig-honestdid plots the robust CIs across values of $\bar M$. The conventional (blue) interval excludes zero with a comfortable margin ($[0.08, 0.50]$). The robust (red) intervals tell a more cautious story: **the breakdown is reached between $\bar M = 0$ and $\bar M = 0.25$** — as soon as the post-treatment violation is allowed to be one-quarter as large as the worst pre-period violation, the robust 95% CI begins to include zero.
+
+The breakdown value is low — substantially lower than what would license treating the parallel-trends assumption as plausibly innocuous. The office effect on ln-wealth is *robust to a zero violation but fragile under any positive violation of comparable magnitude to the pre-period pattern*. @schaff2024 argues that the pre-trend reflects court service rather than anticipation (p. 537), in which case the post-treatment violation should be small (court service ends when council service begins). The sensitivity analysis cannot adjudicate that historical interpretation, but it makes the dependence of the conclusion on the interpretation *quantitative and explicit*: the headline finding survives only if the post-treatment differential trend is essentially zero, an assertion the data alone cannot test.^[Two technical limitations: (i) the TWFE event-study point estimate (~0.29 at $k=0$) differs from the DCDH ATT (0.526) because TWFE under heterogeneous effects targets a weighted combination of $2\times 2$ comparisons rather than a pure ATT [@goodmanbacon2021]. The sensitivity profile applies to the TWFE estimand, but the substantive lesson generalises since DCDH shares the same parallel-trends assumption. (ii) The relative-magnitudes restriction is one of several available in @rambachan2023; a smoothness restriction would yield somewhat different breakdown values.]
+
+The sensitivity exercise does not overturn the paper's findings: post-treatment estimates remain large and statistically significant under conventional inference. What it establishes is that the *formal* identification rests on stronger assumptions than the paper acknowledges, and that the parallel-trends violation flagged but minimised in the original analysis is, by formal robustness criteria, not minor.
+
+# Code Appendix {.unnumbered}
+
+```{r ref.label = knitr::all_labels(), echo = TRUE, eval = FALSE}
+# This chunk generates the complete code appendix.
+# eval=FALSE tells R not to re-run the code here.
+#
+# All heavy computational estimations (Tables 3, 4, 5; Figures 3, 4, 5, 6) 
+# are produced by a separate script replication.R in the repository
+# root. That script writes its outputs to output/*.rds, which are then
+# loaded by this qmd. See README file for instructions on reproducing the heavy
+# computations.
+```
+
+# References {.unnumbered}
+
+::: {#refs}
+:::
